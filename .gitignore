@@ -18,3 +18,4 @@ out/
 app/release/
 app/debug/
 
+keystore.jks
