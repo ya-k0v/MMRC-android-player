@@ -1,4 +1,4 @@
-name: CI
+name: CI + Build
 
 on:
   push:
@@ -8,72 +8,111 @@ on:
   workflow_dispatch:
 
 jobs:
-  lint:
-    name: Lint Check
+  # ── Android ────────────────────────────────────────────────────────────
+  android-lint:
+    name: Android Lint
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: chmod +x gradlew
+      - run: ./gradlew lint
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Grant execute permission
-        run: chmod +x gradlew
-
-      - name: Run Lint
-        run: ./gradlew lint
-
-      - name: Upload Lint Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: lint-report
-          path: app/build/reports/lint-results*.html
-          retention-days: 7
-
-  build:
-    name: Build
-    needs: lint
+  android-build:
+    name: Android Build
+    needs: android-lint
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Grant execute permission
-        run: chmod +x gradlew
-
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug
-
-      - name: Build Release APK
-        run: ./gradlew assembleRelease
-
-      - name: Upload Debug APK
-        uses: actions/upload-artifact@v4
+      - uses: gradle/actions/setup-gradle@v4
+      - run: chmod +x gradlew
+      - run: ./gradlew assembleRelease
+      - uses: actions/upload-artifact@v4
         with:
-          name: MMRC-android-player-debug
-          path: app/build/outputs/apk/debug/*.apk
-          retention-days: 30
-
-      - name: Upload Release APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: MMRC-android-player-release
+          name: MMRC-android-player
           path: app/build/outputs/apk/release/*.apk
           retention-days: 90
+
+  # ── MPV ────────────────────────────────────────────────────────────────
+  mpv-lint:
+    name: MPV Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install flake8
+      - run: flake8 mpv_client.py --max-line-length=120 --ignore=E501,W503
+
+  mpv-syntax:
+    name: MPV Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m py_compile mpv_client.py
+
+  # ── Windows ────────────────────────────────────────────────────────────
+  windows-analyze:
+    name: Windows Analyze
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet restore src/MMRCPlayer/MMRCPlayer.csproj
+      - run: dotnet build src/MMRCPlayer/MMRCPlayer.csproj -c Release --no-restore
+
+  windows-build:
+    name: Windows Build
+    needs: windows-analyze
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet tool install --global wix
+      - run: dotnet publish src/MMRCPlayer/MMRCPlayer.csproj -c Release -r win-x64 --self-contained true -o publish
+      - run: ./build-installer.ps1 -Version "1.0.0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MMRC-win-player-exe
+          path: publish/
+          retention-days: 90
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MMRC-win-player-msi
+          path: output/*.msi
+          retention-days: 90
+
+  # ── Release ────────────────────────────────────────────────────────────
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [android-build, mpv-lint, mpv-syntax, windows-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            MMRC-android-player/*.apk
+            MMRC-win-player-exe/*
+            MMRC-win-player-msi/*.msi
+          draft: false
+          prerelease: false
