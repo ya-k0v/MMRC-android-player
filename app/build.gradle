@@ -3,6 +3,10 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+// Read version from version.json
+def versionFile = file("${rootProject.projectDir}/version.json")
+def versionJson = new groovy.json.JsonSlurper().parseText(versionFile.text)
+
 android {
     namespace 'com.videocontrol.mediaplayer'
     compileSdk 34
@@ -11,8 +15,8 @@ android {
         applicationId "com.videocontrol.mediaplayer"
         minSdk 21
         targetSdk 34
-        versionCode 272
-        versionName "3.2.0"
+        versionCode versionJson.versionCode
+        versionName versionJson.version
     }
 
     signingConfigs {
