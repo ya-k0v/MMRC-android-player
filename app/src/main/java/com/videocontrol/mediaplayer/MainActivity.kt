@@ -728,9 +728,10 @@ class MainActivity : AppCompatActivity() {
 
         val powerManager = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(
-            PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
-            "MMRCPlayer::WakeLock"
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "MMRCPlayer::CpuWakeLock"
         )
+        wakeLock?.setReferenceCounted(false)
         wakeLock?.acquire()
 
         initializePlayer()
