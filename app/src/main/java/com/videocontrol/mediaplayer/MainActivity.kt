@@ -1,4 +1,3 @@
-
 package com.videocontrol.mediaplayer
 
 import android.content.Intent
@@ -93,6 +92,8 @@ sealed class ContentType {
         is Placeholder -> "placeholder"
     }
 }
+
+
 
 // Расширенный FileState
 data class FileState(
@@ -197,6 +198,13 @@ class MainActivity : AppCompatActivity() {
 
     private val TAG = "MMRCPlayer"
     private val userAgent by lazy { "MMRC/${BuildConfig.VERSION_NAME}" }
+    // Android 10 на iconBIT TRS2045 работает только в 32-битном ABI и
+    // ограничивает heap приложения 128 МБ. На таких устройствах два
+    // одновременно созданных ExoPlayer/MediaCodec приводят к OOM.
+    private val isLightweightMode = Build.SUPPORTED_64_BIT_ABIS.isEmpty()
+    private val lightweightBufferMinMs = 5000
+    private val lightweightBufferMaxMs = 15000
+    private val lightweightTargetBufferBytes = 16 * 1024 * 1024
     private var SERVER_URL = ""
     private var DEVICE_ID = ""
     private var contentDeviceId: String = ""
@@ -757,23 +765,45 @@ class MainActivity : AppCompatActivity() {
             initializeSimpleCache()
 
             fun buildLoadControl(): LoadControl {
-                return DefaultLoadControl.Builder()
+                val builder = DefaultLoadControl.Builder()
                     .setAllocator(DefaultAllocator(true, C.DEFAULT_BUFFER_SEGMENT_SIZE))
                     .setBufferDurationsMs(
-                        config.bufferMinMs,
-                        config.bufferMaxMs,
-                        2500,
-                        5000
+                        if (isLightweightMode) lightweightBufferMinMs else config.bufferMinMs,
+                        if (isLightweightMode) lightweightBufferMaxMs else config.bufferMaxMs,
+                        if (isLightweightMode) 1000 else 2500,
+                        if (isLightweightMode) 3000 else 5000
                     )
-                    .setPrioritizeTimeOverSizeThresholds(true)
-                    .build()
+                    .setPrioritizeTimeOverSizeThresholds(!isLightweightMode)
+
+                if (isLightweightMode) {
+                    // Ограничиваем объём allocator-буфера, чтобы 32-битный
+                    // процесс не доходил до dalvik.vm.heapgrowthlimit=128m.
+                    builder.setTargetBufferBytes(lightweightTargetBufferBytes)
+                }
+
+                return builder.build()
             }
 
             val primaryLoadControl = buildLoadControl()
-            val secondaryLoadControl = buildLoadControl()
 
             player = buildPlayer(primaryLoadControl, playerViewPrimary)
-            bufferPlayer = buildPlayer(secondaryLoadControl, playerViewSecondary)
+
+            if (isLightweightMode) {
+                // Не создаём второй ExoPlayer и второй MediaCodec. Он нужен
+                // только для crossfade, который на маломощных 32-битных
+                // приставках отключаем ради стабильности.
+                bufferPlayer = null
+                playerViewSecondary.player = null
+                playerViewSecondary.alpha = 0f
+                playerViewSecondary.visibility = View.GONE
+                Log.i(
+                    TAG,
+                    "Lightweight playback mode enabled: single player, " +
+                        "buffer=${lightweightBufferMinMs}-${lightweightBufferMaxMs}ms"
+                )
+            } else {
+                bufferPlayer = buildPlayer(buildLoadControl(), playerViewSecondary)
+            }
             
             if (player == null) {
                 Log.e(TAG, "Failed to create player instance")
@@ -3670,5 +3700,4 @@ class MainActivity : AppCompatActivity() {
         return super.dispatchKeyEvent(event)
     }
 }
-
 
