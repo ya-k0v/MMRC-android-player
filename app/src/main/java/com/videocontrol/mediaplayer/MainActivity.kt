@@ -1142,12 +1142,12 @@ class MainActivity : AppCompatActivity() {
 
             socket?.on("player/pause") {
                 runOnUiThread {
-                    // Иначе отложенный retry снимет паузу и снова запустит видео.
-                    retryRunnable?.let { mainHandler.removeCallbacks(it) }
-                    retryRunnable = null
                     if (playbackFlags.isPlayingPlaceholder) {
                         return@runOnUiThread
                     }
+                    // Иначе отложенный retry снимет паузу и снова запустит видео.
+                    retryRunnable?.let { mainHandler.removeCallbacks(it) }
+                    retryRunnable = null
                     
                     savedPosition = player?.currentPosition ?: 0
                     player?.pause()
@@ -1192,16 +1192,16 @@ class MainActivity : AppCompatActivity() {
                     mainHandler.removeCallbacks(it)
                     pendingSyncedPlayRunnable = null
                 }
-                // 24/7: отложенный error-retry не должен перезапустить контент
-                // после того, как пришла команда STOP.
-                retryRunnable?.let { mainHandler.removeCallbacks(it) }
-                retryRunnable = null
-                errorRetryCount = 0
-                
                 runOnUiThread {
                     if (playbackFlags.isPlayingPlaceholder && reason != "placeholder_refresh") {
+                        // Не трогаем retry заглушки — это единственный шанс её восстановить.
                         return@runOnUiThread
                     }
+                    // 24/7: отложенный error-retry не должен перезапустить контент
+                    // после того, как пришла команда STOP.
+                    retryRunnable?.let { mainHandler.removeCallbacks(it) }
+                    retryRunnable = null
+                    errorRetryCount = 0
                     
                     stopProgressUpdates() // Останавливаем отправку прогресса
                     
