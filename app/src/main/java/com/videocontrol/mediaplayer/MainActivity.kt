@@ -210,7 +210,7 @@ class MainActivity : AppCompatActivity() {
         val info = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
         val heapMb = Runtime.getRuntime().maxMemory() / (1024L * 1024L)
         when {
-            info.lowMemory || ActivityManager.isLowRamDevice() ||
+            info.lowMemory || am.isLowRamDevice() ||
                 info.totalMem <= 1024L * 1024L * 1024L || heapMb <= 128L -> MemoryProfile.MINIMUM
             info.totalMem <= 3072L * 1024L * 1024L -> MemoryProfile.STANDARD
             else -> MemoryProfile.FULL
