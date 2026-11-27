@@ -1,8 +1,10 @@
 package com.videocontrol.mediaplayer
 
+import android.app.ActivityManager
 import android.content.Intent
 import android.content.Context
 import android.content.BroadcastReceiver
+import android.content.ComponentCallbacks2
 import android.content.IntentFilter
 import android.net.Uri
 import android.os.Bundle
@@ -185,6 +187,7 @@ class MainActivity : AppCompatActivity() {
     private var placeholderTimestamp: Long = 0 // Для обхода кэша при смене заглушки
     private var lastSocketReconnectAttempt = 0L
     private var isSocketReconnecting = false
+    private var socketReconnectStartedAt = 0L
     private var socketBackoffMs = 2000L
     private lateinit var audioManager: AudioManager
     private var currentVolumePercent: Int = 100
@@ -198,13 +201,35 @@ class MainActivity : AppCompatActivity() {
 
     private val TAG = "MMRCPlayer"
     private val userAgent by lazy { "MMRC/${BuildConfig.VERSION_NAME}" }
-    // Android 10 на iconBIT TRS2045 работает только в 32-битном ABI и
-    // ограничивает heap приложения 128 МБ. На таких устройствах два
-    // одновременно созданных ExoPlayer/MediaCodec приводят к OOM.
-    private val isLightweightMode = Build.SUPPORTED_64_BIT_ABIS.isEmpty()
+    // Профиль выбирается по реальной памяти, а не по разрядности ABI:
+    // arm64/x86_64-приставки тоже бывают с 1 ГБ RAM.
+    private enum class MemoryProfile { MINIMUM, STANDARD, FULL }
+
+    private val memoryProfile: MemoryProfile by lazy {
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val info = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
+        val heapMb = Runtime.getRuntime().maxMemory() / (1024L * 1024L)
+        when {
+            info.lowMemory || ActivityManager.isLowRamDevice() ||
+                info.totalMem <= 1024L * 1024L * 1024L || heapMb <= 128L -> MemoryProfile.MINIMUM
+            info.totalMem <= 3072L * 1024L * 1024L -> MemoryProfile.STANDARD
+            else -> MemoryProfile.FULL
+        }
+    }
+
+    private val isLightweightMode: Boolean get() = memoryProfile == MemoryProfile.MINIMUM
     private val lightweightBufferMinMs = 5000
     private val lightweightBufferMaxMs = 15000
     private val lightweightTargetBufferBytes = 16 * 1024 * 1024
+    private val standardTargetBufferBytes = 32 * 1024 * 1024
+
+    // Дисковый кэш 200 МБ на слабом устройстве только усугубляет pressure.
+    private val effectiveCacheSize: Long
+        get() = when (memoryProfile) {
+            MemoryProfile.MINIMUM -> minOf(config.cacheSize, 64L * 1024 * 1024)
+            MemoryProfile.STANDARD -> minOf(config.cacheSize, 100L * 1024 * 1024)
+            MemoryProfile.FULL -> config.cacheSize
+        }
     private var SERVER_URL = ""
     private var DEVICE_ID = ""
     private var contentDeviceId: String = ""
@@ -761,7 +786,6 @@ class MainActivity : AppCompatActivity() {
                 return
             }
             
-            releaseSimpleCache()
             initializeSimpleCache()
 
             fun buildLoadControl(): LoadControl {
@@ -773,12 +797,12 @@ class MainActivity : AppCompatActivity() {
                         if (isLightweightMode) 1000 else 2500,
                         if (isLightweightMode) 3000 else 5000
                     )
-                    .setPrioritizeTimeOverSizeThresholds(!isLightweightMode)
+                    .setPrioritizeTimeOverSizeThresholds(memoryProfile == MemoryProfile.FULL)
 
-                if (isLightweightMode) {
-                    // Ограничиваем объём allocator-буфера, чтобы 32-битный
-                    // процесс не доходил до dalvik.vm.heapgrowthlimit=128m.
-                    builder.setTargetBufferBytes(lightweightTargetBufferBytes)
+                when (memoryProfile) {
+                    MemoryProfile.MINIMUM -> builder.setTargetBufferBytes(lightweightTargetBufferBytes)
+                    MemoryProfile.STANDARD -> builder.setTargetBufferBytes(standardTargetBufferBytes)
+                    MemoryProfile.FULL -> Unit
                 }
 
                 return builder.build()
@@ -788,21 +812,20 @@ class MainActivity : AppCompatActivity() {
 
             player = buildPlayer(primaryLoadControl, playerViewPrimary)
 
-            if (isLightweightMode) {
-                // Не создаём второй ExoPlayer и второй MediaCodec. Он нужен
-                // только для crossfade, который на маломощных 32-битных
-                // приставках отключаем ради стабильности.
+            if (memoryProfile == MemoryProfile.FULL) {
+                bufferPlayer = buildPlayer(buildLoadControl(), playerViewSecondary)
+            } else {
+                // Второй ExoPlayer/MediaCodec нужен только для crossfade.
+                // На 1-3 ГБ он лишний и является основным источником OOM.
                 bufferPlayer = null
                 playerViewSecondary.player = null
                 playerViewSecondary.alpha = 0f
                 playerViewSecondary.visibility = View.GONE
                 Log.i(
                     TAG,
-                    "Lightweight playback mode enabled: single player, " +
-                        "buffer=${lightweightBufferMinMs}-${lightweightBufferMaxMs}ms"
+                    "Memory profile ${memoryProfile}: single player, " +
+                        "cache=${effectiveCacheSize / (1024L * 1024L)}MB"
                 )
-            } else {
-                bufferPlayer = buildPlayer(buildLoadControl(), playerViewSecondary)
             }
             
             if (player == null) {
@@ -898,7 +921,7 @@ class MainActivity : AppCompatActivity() {
                             return
                         }
 
-                            val maxAttempts = if (!playbackFlags.isPlayingPlaceholder) 10 else maxRetryAttempts
+                            val maxAttempts = if (!playbackFlags.isPlayingPlaceholder) 5 else maxRetryAttempts
                             
                             showStatus("Ошибка воспроизведения, попытка $errorRetryCount/$maxAttempts...")
                             
@@ -912,8 +935,9 @@ class MainActivity : AppCompatActivity() {
                                     errorRetryCount++
                                     
                                     try {
-                                        player?.prepare()
-                                        player?.play()
+                                        // prepare() на том же битом источнике бесполезен —
+                                        // пересоздаём кэш и MediaSource целиком.
+                                        rebuildSourceAfterError()
                                     } catch (e: OutOfMemoryError) {
                                         Log.e(TAG, "OutOfMemoryError during retry, clearing caches", e)
                                         handleOutOfMemory()
@@ -921,15 +945,15 @@ class MainActivity : AppCompatActivity() {
                                         Log.e(TAG, "Retry failed: ${e.message}", e)
                                     }
                                 } else {
-                                    if (!playbackFlags.isPlayingPlaceholder) {
-                                        Log.e(TAG, "Max retry attempts for content, loading placeholder")
-                                        loadPlaceholder()
-                                    }
+                                    Log.e(TAG, "Max retry attempts ($maxAttempts), loading placeholder")
                                     errorRetryCount = 0
-                                    loadPlaceholder()
+                                    // Иначе следующий Play уйдёт в isSameFile и ничего не сделает.
+                                    currentVideoFile = null
+                                    playbackFlags.isLoadingPlaceholder = false
+                                    loadPlaceholder(forceReload = true)
                                 }
                             }
-                        mainHandler.postDelayed(retryRunnable!!, 5000)
+                        mainHandler.postDelayed(retryRunnable!!, 1500)
                         }
 
                         override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -977,7 +1001,7 @@ class MainActivity : AppCompatActivity() {
         try {
             simpleCache = SimpleCache(
                 videoCacheDir,
-                LeastRecentlyUsedCacheEvictor(config.cacheSize),
+                LeastRecentlyUsedCacheEvictor(effectiveCacheSize),
                 StandaloneDatabaseProvider(this)
             )
         } catch (e: IllegalStateException) {
@@ -986,7 +1010,7 @@ class MainActivity : AppCompatActivity() {
             videoCacheDir.mkdirs()
             simpleCache = SimpleCache(
                 videoCacheDir,
-                LeastRecentlyUsedCacheEvictor(config.cacheSize),
+                LeastRecentlyUsedCacheEvictor(effectiveCacheSize),
                 StandaloneDatabaseProvider(this)
             )
         } catch (e: Exception) {
@@ -1007,6 +1031,7 @@ class MainActivity : AppCompatActivity() {
 
             socket?.on(Socket.EVENT_CONNECT) {
                 isSocketReconnecting = false
+                socketReconnectStartedAt = 0L
                 socketBackoffMs = 2000L
                 runOnUiThread {
                     showStatus("Подключено", autohideSeconds = 2)  // Скрываем через 2 сек
@@ -1117,6 +1142,9 @@ class MainActivity : AppCompatActivity() {
 
             socket?.on("player/pause") {
                 runOnUiThread {
+                    // Иначе отложенный retry снимет паузу и снова запустит видео.
+                    retryRunnable?.let { mainHandler.removeCallbacks(it) }
+                    retryRunnable = null
                     if (playbackFlags.isPlayingPlaceholder) {
                         return@runOnUiThread
                     }
@@ -1136,10 +1164,16 @@ class MainActivity : AppCompatActivity() {
                     }
                     
                     if (player != null && currentVideoFile != null) {
-                        // Продолжаем воспроизведение с сохраненной позиции
-                        player?.apply {
-                            playWhenReady = true
-                            play()
+                        if (player?.playbackState == Player.STATE_IDLE ||
+                            (player?.mediaItemCount ?: 0) == 0
+                        ) {
+                            // После Source error вызов play() в STATE_IDLE ничего не делает.
+                            rebuildSourceAfterError()
+                        } else {
+                            player?.apply {
+                                playWhenReady = true
+                                play()
+                            }
                         }
                     } else {
                         Log.w(TAG, "Resume: нет активного видео для продолжения")
@@ -1158,6 +1192,11 @@ class MainActivity : AppCompatActivity() {
                     mainHandler.removeCallbacks(it)
                     pendingSyncedPlayRunnable = null
                 }
+                // 24/7: отложенный error-retry не должен перезапустить контент
+                // после того, как пришла команда STOP.
+                retryRunnable?.let { mainHandler.removeCallbacks(it) }
+                retryRunnable = null
+                errorRetryCount = 0
                 
                 runOnUiThread {
                     if (playbackFlags.isPlayingPlaceholder && reason != "placeholder_refresh") {
@@ -1755,6 +1794,46 @@ class MainActivity : AppCompatActivity() {
         resetPendingVideoState()
     }
 
+    /**
+     * 24/7: Source error портит MediaSource и может оставить SimpleCache в
+     * неконсистентном состоянии. Повторный prepare() на том же объекте вернёт
+     * ту же ошибку, поэтому пересоздаём цепочку кэш -> DataSource -> MediaSource.
+     */
+    private fun rebuildSourceAfterError() {
+        val fileName = currentVideoFile
+        if (fileName.isNullOrEmpty() || isDestroyed || isFinishing) {
+            Log.w(TAG, "rebuildSourceAfterError: нет файла для повторной загрузки")
+            return
+        }
+        val wasPlaceholder = playbackFlags.isPlayingPlaceholder
+        Log.w(TAG, "Rebuilding media source for $fileName (placeholder=$wasPlaceholder)")
+
+        try {
+            player?.stop()
+            player?.clearMediaItems()
+            cancelPendingBuffer("rebuildSourceAfterError")
+            bufferPlayer?.stop()
+            bufferPlayer?.clearMediaItems()
+            releaseSimpleCache()
+            initializeSimpleCache()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error rebuilding cache: ${e.message}", e)
+        }
+
+        // Принудительно обходим fast-path isSameFile в playVideo().
+        currentVideoFile = null
+        playbackFlags.isLoadingPlaceholder = false
+        // playVideo()/playAudio() сбрасывают счётчик в prepareContentPlayback —
+        // сохраняем его, иначе retry станет бесконечным.
+        val attempts = errorRetryCount
+        if (currentFileState?.type == "audio") {
+            playAudio(fileName)
+        } else {
+            playVideo(fileName, wasPlaceholder)
+        }
+        errorRetryCount = attempts
+    }
+
     private fun playVideo(fileName: String, isPlaceholder: Boolean = false) {
         if (isDestroyed || isFinishing) return
 
@@ -1786,7 +1865,13 @@ class MainActivity : AppCompatActivity() {
                 retryRunnable = null
             }
 
-            val isSameFile = currentVideoFile == fileName && !isPlaceholder
+            // 24/7: после Source error плеер остаётся в STATE_IDLE, но currentVideoFile
+            // всё ещё равен fileName. fast-path без проверки состояния даёт "Play не работает".
+            val activePlayer = player
+            val isSameFile = currentVideoFile == fileName && !isPlaceholder &&
+                activePlayer != null && activePlayer.mediaItemCount > 0 &&
+                (activePlayer.playbackState == Player.STATE_READY ||
+                 activePlayer.playbackState == Player.STATE_BUFFERING)
             
             if (isSameFile && player != null) {
                 // Тот же файл - продолжаем с сохраненной позиции (без переходов, как в videojs)
@@ -1868,7 +1953,11 @@ class MainActivity : AppCompatActivity() {
                 retryRunnable = null
             }
 
-            val isSameFile = currentVideoFile == fileName
+            val activePlayer = player
+            val isSameFile = currentVideoFile == fileName && activePlayer != null &&
+                activePlayer.mediaItemCount > 0 &&
+                (activePlayer.playbackState == Player.STATE_READY ||
+                 activePlayer.playbackState == Player.STATE_BUFFERING)
             if (isSameFile && player != null) {
                 if (savedPosition > 0) {
                     player?.seekTo(savedPosition)
@@ -3237,9 +3326,20 @@ class MainActivity : AppCompatActivity() {
     }
     
     private fun ensureSocketConnected(reason: String) {
-        if (isDestroyed || isFinishing || isSocketReconnecting) return
-        
+        if (isDestroyed || isFinishing) return
+
         val now = SystemClock.elapsedRealtime()
+        // 24/7: если EVENT_CONNECT так и не пришёл, флаг оставался true навсегда
+        // и watchdog больше не мог принудительно пересоздать сокет.
+        if (isSocketReconnecting && socketReconnectStartedAt > 0L &&
+            now - socketReconnectStartedAt > 30_000L
+        ) {
+            Log.w(TAG, "Stuck socket reconnect detected ($reason), forcing new socket")
+            isSocketReconnecting = false
+            // Ниже обычный путь корректно снимет слушатели и вызовет disconnect().
+        }
+        if (isSocketReconnecting) return
+
         if (now - lastSocketReconnectAttempt < socketBackoffMs) {
             return
         }
@@ -3252,6 +3352,7 @@ class MainActivity : AppCompatActivity() {
         
         isSocketReconnecting = true
         lastSocketReconnectAttempt = now
+        socketReconnectStartedAt = now
         
         if (currentSocket != null) {
             Log.w(TAG, "Socket disconnected, forcing reconnect ($reason)")
@@ -3466,12 +3567,9 @@ class MainActivity : AppCompatActivity() {
         super.onTrimMemory(level)
         
         // Все происходит незаметно для зрителей - воспроизведение не прерывается
-        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
-            Log.w(TAG, "Low memory detected (level $level), clearing caches in background")
-            
-            val isPlaceholderPlaying = playbackFlags.isPlayingPlaceholder
-            val isPlayerPlaying = player?.isPlaying == true
-            
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            Log.w(TAG, "Low memory detected (level $level), clearing Glide memory in background")
+
             // Очистка в фоне, чтобы не блокировать воспроизведение
             lifecycleScope.launch(Dispatchers.IO) {
                 try {
@@ -3485,42 +3583,11 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                     
-                    // При критической нехватке памяти - более агрессивная очистка
-                    if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL) {
-                        Log.w(TAG, "Critical memory level - aggressive cleanup in background")
-                        
-                        // Очищаем disk cache Glide
-                        try {
-                            Glide.get(this@MainActivity).clearDiskCache()
-                            
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Failed to clear Glide disk cache: ${e.message}", e)
-                        }
-                        
-                        // Если играет заглушка - НЕ трогаем, она должна продолжать играть
-                        if (!isPlayerPlaying && !isPlaceholderPlaying) {
-                            withContext(Dispatchers.Main) {
-                                try {
-                                    releaseSimpleCache()
-                                    // Переинициализируем через задержку
-                                    mainHandler.postDelayed({
-                                        try {
-                                            if (!isDestroyed && !isFinishing) {
-                                                initializeSimpleCache()
-                                            }
-                                        } catch (e: Exception) {
-                                            Log.e(TAG, "Error reinitializing cache: ${e.message}", e)
-                                        }
-                                    }, 1000)
-                                    
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "Error clearing ExoPlayer cache: ${e.message}", e)
-                                }
-                            }
-                        } else {
-                            
-                        }
-                    }
+                    // ВАЖНО для 24/7: simpleCache НЕ освобождаем здесь.
+                    // CacheDataSource активного плеера держит ссылку на него,
+                    // release() во время буферизации даёт Source error.
+                    // На Android 14+ legacy TRIM_MEMORY_RUNNING_* больше не
+                    // доставляются, а на Android 10 их обработка ломала play.
                     
                     // Принудительный сбор мусора в фоне
                     System.gc()
@@ -3568,27 +3635,10 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 
-                // 3. Очищаем ExoPlayer кэш только если не играет контент
-                // (если играет заглушка - не трогаем, она должна продолжать играть)
-                if (!wasPlayerPlaying && !wasPlayingPlaceholder) {
-                    withContext(Dispatchers.Main) {
-                        try {
-                            releaseSimpleCache()
-                            // Переинициализируем кэш через небольшую задержку
-                            mainHandler.postDelayed({
-                                try {
-                                    if (!isDestroyed && !isFinishing) {
-                                        initializeSimpleCache()
-                                    }
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "Error reinitializing cache: ${e.message}", e)
-                                }
-                            }, 1000)
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Error releasing cache: ${e.message}", e)
-                        }
-                    }
-                }
+                // 3. ВАЖНО для 24/7: simpleCache не освобождаем при OOM.
+                // Даже "не играющий" плеер может держать CacheDataSource со ссылкой
+                // на него — release() приведёт к IllegalStateException и Source error.
+                // Кэш освобождается только в rebuildSourceAfterError() и onDestroy().
                 
                 // 4. Принудительный сбор мусора в фоне
                 System.gc()
