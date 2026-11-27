@@ -189,6 +189,8 @@ class MainActivity : AppCompatActivity() {
     private var isSocketReconnecting = false
     private var socketReconnectStartedAt = 0L
     private var socketBackoffMs = 2000L
+    // 24/7: сокет может оставаться connected(), но не принимать входящие данные.
+    private var lastInboundAt = 0L
     private lateinit var audioManager: AudioManager
     private var currentVolumePercent: Int = 100
     private var currentMuteState: Boolean = false
@@ -1030,6 +1032,7 @@ class MainActivity : AppCompatActivity() {
             socket = IO.socket(SERVER_URL, opts)
 
             socket?.on(Socket.EVENT_CONNECT) {
+                noteInbound("connect")
                 isSocketReconnecting = false
                 socketReconnectStartedAt = 0L
                 socketBackoffMs = 2000L
@@ -1393,8 +1396,8 @@ class MainActivity : AppCompatActivity() {
             }
             
             socket?.on("player/pong") {
-                // Pong получен - соединение работает нормально
-                // Socket.IO сам управляет reconnect, Watchdog больше не нужен
+                //=Pong — единственный регулярный входящий сигнал от сервера.
+                noteInbound("player/pong")
             }
             
             socket?.on("player/openSettings") {
@@ -3324,6 +3327,11 @@ class MainActivity : AppCompatActivity() {
         socketBackoffMs = min(socketBackoffMs * 2, 60000L)
         Log.d(TAG, "Socket reconnect backoff increased to ${socketBackoffMs}ms")
     }
+
+    private fun noteInbound(event: String) {
+        lastInboundAt = SystemClock.elapsedRealtime()
+        Log.d(TAG, "↙ Inbound $event")
+    }
     
     private fun ensureSocketConnected(reason: String) {
         if (isDestroyed || isFinishing) return
@@ -3346,8 +3354,13 @@ class MainActivity : AppCompatActivity() {
         
         val currentSocket = socket
         if (currentSocket != null && currentSocket.connected()) {
-            socketBackoffMs = 2000L
-            return
+            // connected() может быть true, пока входящие данные не читаются.
+            // Регулярный pong приходит на каждый ping (~20 с), поэтому 60 с без inbound — аномалия.
+            if (lastInboundAt == 0L || now - lastInboundAt <= 60_000L) {
+                socketBackoffMs = 2000L
+                return
+            }
+            Log.w(TAG, "Socket connected but no inbound for ${(now - lastInboundAt) / 1000}s, forcing reconnect ($reason)")
         }
         
         isSocketReconnecting = true
