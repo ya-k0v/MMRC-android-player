@@ -191,6 +191,8 @@ class MainActivity : AppCompatActivity() {
     private var socketBackoffMs = 2000L
     // 24/7: сокет может оставаться connected(), но не принимать входящие данные.
     private var lastInboundAt = 0L
+    // Не требуем pong от серверов, которые его не шлют: watchdog работает только после первого pong.
+    private var hasSeenPong = false
     private lateinit var audioManager: AudioManager
     private var currentVolumePercent: Int = 100
     private var currentMuteState: Boolean = false
@@ -1033,6 +1035,7 @@ class MainActivity : AppCompatActivity() {
 
             socket?.on(Socket.EVENT_CONNECT) {
                 noteInbound("connect")
+                hasSeenPong = false
                 isSocketReconnecting = false
                 socketReconnectStartedAt = 0L
                 socketBackoffMs = 2000L
@@ -1397,6 +1400,7 @@ class MainActivity : AppCompatActivity() {
             
             socket?.on("player/pong") {
                 //=Pong — единственный регулярный входящий сигнал от сервера.
+                hasSeenPong = true
                 noteInbound("player/pong")
             }
             
@@ -3356,7 +3360,7 @@ class MainActivity : AppCompatActivity() {
         if (currentSocket != null && currentSocket.connected()) {
             // connected() может быть true, пока входящие данные не читаются.
             // Регулярный pong приходит на каждый ping (~20 с), поэтому 60 с без inbound — аномалия.
-            if (lastInboundAt == 0L || now - lastInboundAt <= 60_000L) {
+            if (!hasSeenPong || lastInboundAt == 0L || now - lastInboundAt <= 60_000L) {
                 socketBackoffMs = 2000L
                 return
             }
