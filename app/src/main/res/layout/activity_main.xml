@@ -31,7 +31,7 @@
         android:importantForAccessibility="no" />
 
     <!-- ExoPlayer View -->
-    <com.google.android.exoplayer2.ui.StyledPlayerView
+    <androidx.media3.ui.PlayerView
         android:id="@+id/playerView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
@@ -40,7 +40,7 @@
         app:surface_type="texture_view" />
 
     <!-- Второй слой ExoPlayer для кроссфейда -->
-    <com.google.android.exoplayer2.ui.StyledPlayerView
+    <androidx.media3.ui.PlayerView
         android:id="@+id/playerViewBuffer"
         android:layout_width="match_parent"
         android:layout_height="match_parent"

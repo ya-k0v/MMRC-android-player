@@ -20,6 +20,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v5
       - run: chmod +x gradlew
       - run: ./gradlew lint
+      - run: ./gradlew test
 
   build:
     name: Build

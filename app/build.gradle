@@ -72,12 +72,15 @@ dependencies {
     // Security fix: Force okio to secure version (overrides transitive dependency)
     implementation 'com.squareup.okio:okio:3.6.0'
 
-    // ExoPlayer для стабильного воспроизведения
-    implementation 'com.google.android.exoplayer:exoplayer:2.19.1'
-    // ExoPlayer HLS для поддержки стримов
-    implementation 'com.google.android.exoplayer:exoplayer-hls:2.19.1'
-    // ExoPlayer DASH для прямого DASH воспроизведения
-    implementation 'com.google.android.exoplayer:exoplayer-dash:2.19.1'
+    // Media3 1.4.0 — последняя стабильная версия с minCompileSdk=34.
+    // Один APK без нативных библиотек: arm32/arm64/x86/x86_64 и Android 10+.
+    def media3Version = '1.4.0'
+    implementation "androidx.media3:media3-exoplayer:$media3Version"
+    implementation "androidx.media3:media3-exoplayer-hls:$media3Version"
+    implementation "androidx.media3:media3-exoplayer-dash:$media3Version"
+    implementation "androidx.media3:media3-ui:$media3Version"
+    // Классы androidx.media3.datasource.cache.* живут в media3-datasource.
+    implementation "androidx.media3:media3-datasource:$media3Version"
 
     // Coroutines
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
@@ -94,5 +97,8 @@ dependencies {
 
     // SVG decoding for server-hosted logos
     implementation 'com.caverock:androidsvg:1.4'
+
+    // Чистые JVM-тесты политики 24/7 (без Android-рантайма)
+    testImplementation 'junit:junit:4.13.2'
 }
 

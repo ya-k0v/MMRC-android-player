@@ -7,6 +7,11 @@ import android.content.BroadcastReceiver
 import android.content.ComponentCallbacks2
 import android.content.IntentFilter
 import android.net.Uri
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -20,23 +25,25 @@ import android.widget.ImageView
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import com.google.android.exoplayer2.ExoPlayer
-import com.google.android.exoplayer2.MediaItem
-import com.google.android.exoplayer2.Player
-import com.google.android.exoplayer2.ui.StyledPlayerView
-import com.google.android.exoplayer2.source.ProgressiveMediaSource
-import com.google.android.exoplayer2.source.dash.DashMediaSource
-import com.google.android.exoplayer2.source.hls.HlsMediaSource
-import com.google.android.exoplayer2.upstream.DefaultHttpDataSource
-import com.google.android.exoplayer2.upstream.DefaultDataSource
-import com.google.android.exoplayer2.upstream.DefaultAllocator
-import com.google.android.exoplayer2.DefaultLoadControl
-import com.google.android.exoplayer2.LoadControl
-import com.google.android.exoplayer2.C
-import com.google.android.exoplayer2.upstream.cache.CacheDataSource
-import com.google.android.exoplayer2.upstream.cache.LeastRecentlyUsedCacheEvictor
-import com.google.android.exoplayer2.upstream.cache.SimpleCache
-import com.google.android.exoplayer2.database.StandaloneDatabaseProvider
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
+import androidx.media3.datasource.cache.SimpleCache
+import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.LoadControl
+import androidx.media3.exoplayer.dash.DashMediaSource
+import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.exoplayer.upstream.DefaultAllocator
+import androidx.media3.ui.PlayerView
 import java.io.File
 import io.socket.client.IO
 import io.socket.client.Socket
@@ -132,12 +139,14 @@ data class PlaybackFlags(
     }
 }
 
+private typealias MemoryProfile = PlayerPolicy.MemoryProfile
+
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var playerView: StyledPlayerView
-    private lateinit var playerViewPrimary: StyledPlayerView
-    private lateinit var playerViewSecondary: StyledPlayerView
-    private lateinit var bufferPlayerView: StyledPlayerView
+    private lateinit var playerView: PlayerView
+    private lateinit var playerViewPrimary: PlayerView
+    private lateinit var playerViewSecondary: PlayerView
+    private lateinit var bufferPlayerView: PlayerView
     private lateinit var imageView: ImageView
     private lateinit var statusText: TextView
     private lateinit var brandBg: ImageView
@@ -147,10 +156,14 @@ class MainActivity : AppCompatActivity() {
     private var player: ExoPlayer? = null
     private var bufferPlayer: ExoPlayer? = null
     private var pendingPlayer: ExoPlayer? = null
-    private var pendingPlayerView: StyledPlayerView? = null
+    private var pendingPlayerView: PlayerView? = null
     private var socket: Socket? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var simpleCache: SimpleCache? = null
+    // 24/7: сон/пробуждение и смена сети обрабатываются сразу, а не по 60-секундному таймауту.
+    private var screenReceiver: BroadcastReceiver? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val startedAtMs = SystemClock.elapsedRealtime()
     // Объединенный Handler для всех задач
     private val mainHandler = Handler(Looper.getMainLooper())
     private var retryRunnable: Runnable? = null
@@ -207,18 +220,15 @@ class MainActivity : AppCompatActivity() {
     private val userAgent by lazy { "MMRC/${BuildConfig.VERSION_NAME}" }
     // Профиль выбирается по реальной памяти, а не по разрядности ABI:
     // arm64/x86_64-приставки тоже бывают с 1 ГБ RAM.
-    private enum class MemoryProfile { MINIMUM, STANDARD, FULL }
-
     private val memoryProfile: MemoryProfile by lazy {
         val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val info = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
-        val heapMb = Runtime.getRuntime().maxMemory() / (1024L * 1024L)
-        when {
-            info.lowMemory || am.isLowRamDevice() ||
-                info.totalMem <= 1024L * 1024L * 1024L || heapMb <= 128L -> MemoryProfile.MINIMUM
-            info.totalMem <= 3072L * 1024L * 1024L -> MemoryProfile.STANDARD
-            else -> MemoryProfile.FULL
-        }
+        PlayerPolicy.memoryProfile(
+            totalMemBytes = info.totalMem,
+            heapMaxBytes = Runtime.getRuntime().maxMemory(),
+            lowMemory = info.lowMemory,
+            lowRamDevice = am.isLowRamDevice()
+        )
     }
 
     private val isLightweightMode: Boolean get() = memoryProfile == MemoryProfile.MINIMUM
@@ -229,11 +239,7 @@ class MainActivity : AppCompatActivity() {
 
     // Дисковый кэш 200 МБ на слабом устройстве только усугубляет pressure.
     private val effectiveCacheSize: Long
-        get() = when (memoryProfile) {
-            MemoryProfile.MINIMUM -> minOf(config.cacheSize, 64L * 1024 * 1024)
-            MemoryProfile.STANDARD -> minOf(config.cacheSize, 100L * 1024 * 1024)
-            MemoryProfile.FULL -> config.cacheSize
-        }
+        get() = PlayerPolicy.effectiveCacheSize(memoryProfile, config.cacheSize)
     private var SERVER_URL = ""
     private var DEVICE_ID = ""
     private var contentDeviceId: String = ""
@@ -703,6 +709,100 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun reacquireWakeLock() {
+        try {
+            if (wakeLock?.isHeld != true) {
+                wakeLock?.acquire()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to re-acquire wake lock: ${e.message}")
+        }
+    }
+
+    private fun registerLifecycleReceivers() {
+        if (screenReceiver == null) {
+            screenReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    when (intent?.action) {
+                        Intent.ACTION_SCREEN_ON -> {
+                            PlayerMetrics.noteScreenWake()
+                            Log.i(TAG, "Screen ON: reacquiring wake lock and checking socket")
+                            reacquireWakeLock()
+                            mainHandler.post {
+                                if (!isDestroyed && !isFinishing) {
+                                    ensureSocketConnected("screen_on")
+                                    socket?.emit("player/ping")
+                                }
+                            }
+                        }
+                        Intent.ACTION_SCREEN_OFF -> {
+                            Log.i(TAG, "Screen OFF: playback continues (24/7)")
+                        }
+                    }
+                }
+            }
+            val filter = IntentFilter(Intent.ACTION_SCREEN_ON).apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+            }
+            try {
+                registerReceiver(screenReceiver, filter)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to register screen receiver", e)
+                screenReceiver = null
+            }
+        }
+
+        if (networkCallback == null) {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+            networkCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = onNetworkChanged("available")
+                override fun onLost(network: Network) = onNetworkChanged("lost")
+                override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) =
+                    onNetworkChanged("link")
+            }
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            try {
+                cm.registerNetworkCallback(request, networkCallback)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to register network callback", e)
+                networkCallback = null
+            }
+        }
+    }
+
+    private fun onNetworkChanged(kind: String) {
+        PlayerMetrics.noteNetworkChange()
+        Log.i(TAG, "Network $kind: checking socket")
+        mainHandler.post {
+            if (!isDestroyed && !isFinishing) {
+                ensureSocketConnected("network_$kind")
+                socket?.emit("player/ping")
+            }
+        }
+    }
+
+    private fun unregisterLifecycleReceivers() {
+        try {
+            screenReceiver?.let { unregisterReceiver(it) }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to unregister screen receiver", e)
+        } finally {
+            screenReceiver = null
+        }
+        try {
+            networkCallback?.let {
+                (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
+                    ?.unregisterNetworkCallback(it)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to unregister network callback", e)
+        } finally {
+            networkCallback = null
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -774,6 +874,8 @@ class MainActivity : AppCompatActivity() {
         initializePlayer()
         connectSocket()
         startConnectionWatchdog()
+        registerLifecycleReceivers()
+        startMetricsLogging()
         loadPlaceholder()
     }
 
@@ -844,7 +946,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun buildPlayer(loadControl: LoadControl, targetView: StyledPlayerView): ExoPlayer {
+    private fun buildPlayer(loadControl: LoadControl, targetView: PlayerView): ExoPlayer {
         return ExoPlayer.Builder(this)
                 .setLoadControl(loadControl)
                 .build()
@@ -867,6 +969,7 @@ class MainActivity : AppCompatActivity() {
                                 Player.STATE_READY -> {
                                 if (isActivePlayer) {
                                     errorRetryCount = 0
+                                    PlayerMetrics.noteReady()
                                     hideStatus()
                                 }
                                 }
@@ -904,7 +1007,7 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
 
-                        override fun onPlayerError(error: com.google.android.exoplayer2.PlaybackException) {
+                        override fun onPlayerError(error: PlaybackException) {
                         val isActivePlayer = exoPlayer === player
                         if (!isActivePlayer && exoPlayer !== pendingPlayer) {
                             Log.e(TAG, "Player error on inactive buffer layer: ${error.message}")
@@ -912,6 +1015,7 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         Log.e(TAG, "Player error (${if (isActivePlayer) "active" else "buffer"}): ${error.message} (attempt $errorRetryCount/$maxRetryAttempts)", error)
+                        PlayerMetrics.noteSourceError()
 
                         if (!isActivePlayer) {
                             pendingPlayer = null
@@ -979,7 +1083,7 @@ class MainActivity : AppCompatActivity() {
                         }
                         }
                         
-                        override fun onVideoSizeChanged(videoSize: com.google.android.exoplayer2.video.VideoSize) {
+                        override fun onVideoSizeChanged(videoSize: VideoSize) {
                         if (exoPlayer !== player) {
                             return
                         }
@@ -1397,11 +1501,28 @@ class MainActivity : AppCompatActivity() {
             socket?.on("player/registered") {
                 runOnUiThread { emitVolumeState("register") }
             }
+
+            // Сервер отдаёт текущий контент при каждой регистрации.
+            // Без этого обработчика команды, пропущенные во время «залипшего» сокета, теряются.
+            socket?.on("player/state") { args ->
+                val data = args.firstOrNull() as? JSONObject ?: return@on
+                runOnUiThread { applyServerState(data) }
+            }
             
             socket?.on("player/pong") {
-                //=Pong — единственный регулярный входящий сигнал от сервера.
+                // Pong — регулярный входящий сигнал от сервера.
                 hasSeenPong = true
+                PlayerMetrics.notePong()
                 noteInbound("player/pong")
+            }
+
+            // Логируем ВСЕ входящие события: без этого нельзя отличить
+            // «сервер не шлёт» от «клиент не читает» (случай 002).
+            socket?.onAnyIncoming { args ->
+                val event = args.firstOrNull() as? String ?: return@onAnyIncoming
+                if (event != "player/pong" && event != Socket.EVENT_CONNECT) {
+                    noteInbound(event)
+                }
             }
             
             socket?.on("player/openSettings") {
@@ -1450,6 +1571,33 @@ class MainActivity : AppCompatActivity() {
             
         } catch (e: Exception) {
             Log.e(TAG, "Error registering device", e)
+        }
+    }
+
+    /**
+     * Применяем состояние сервера после пересоздания сокета.
+     * Только video/audio и только когда локальный плеер действительно не играет,
+     * чтобы не запускать повторную загрузку на каждом EVENT_CONNECT.
+     */
+    private fun applyServerState(data: JSONObject) {
+        try {
+            val type = data.optString("type").lowercase()
+            if (type != "video" && type != "audio") return
+            val file = data.optString("file").takeIf { it.isNotBlank() } ?: return
+            val state = data.optString("state").lowercase()
+            if (state.isNotBlank() && state != "playing" && state != "play") return
+
+            val active = player
+            if (!playbackFlags.isPlayingPlaceholder && currentVideoFile == file && active != null &&
+                (active.playbackState == Player.STATE_READY || active.playbackState == Player.STATE_BUFFERING)
+            ) {
+                return
+            }
+
+            Log.i(TAG, "Applying server state after reconnect: $type/$file")
+            handlePlay(data)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to apply server state: ${e.message}")
         }
     }
 
@@ -1759,7 +1907,7 @@ class MainActivity : AppCompatActivity() {
                 override fun onAnimationEnd(animation: android.animation.Animator) {
                     if (hasOutgoingVideo) {
                         // 1. Отвязываем плеер от Surface
-                        if (outgoingView is StyledPlayerView) {
+                        if (outgoingView is PlayerView) {
                             outgoingView.player = null
                         }
                         // 2. Останавливаем плеер и очищаем медиа
@@ -1783,7 +1931,7 @@ class MainActivity : AppCompatActivity() {
         animator.start()
     }
 
-    private fun finalizeVideoSwap(newActivePlayer: ExoPlayer, newActiveView: StyledPlayerView) {
+    private fun finalizeVideoSwap(newActivePlayer: ExoPlayer, newActiveView: PlayerView) {
         val previousPlayer = player
         val previousView = playerView
 
@@ -2047,7 +2195,7 @@ class MainActivity : AppCompatActivity() {
     // Функция для безопасного освобождения плеера с увеличенной задержкой
     private fun safeReleasePlayer(
         player: ExoPlayer,
-        view: StyledPlayerView,
+        view: PlayerView,
         onComplete: (Boolean) -> Unit
     ) {
         try {
@@ -2081,7 +2229,7 @@ class MainActivity : AppCompatActivity() {
         audioUrl: String,
         originalFileName: String,
         targetPlayer: ExoPlayer,
-        targetView: StyledPlayerView
+        targetView: PlayerView
     ) {
         try {
             val httpDataSourceFactory = DefaultHttpDataSource.Factory().apply {
@@ -2163,7 +2311,7 @@ class MainActivity : AppCompatActivity() {
         originalFileName: String,
         isPlaceholder: Boolean,
         targetPlayer: ExoPlayer,
-        targetView: StyledPlayerView
+        targetView: PlayerView
     ) {
         try {
             
@@ -2263,7 +2411,7 @@ class MainActivity : AppCompatActivity() {
         streamProtocol: String,
         originalFileName: String,
         targetPlayer: ExoPlayer,
-        targetView: StyledPlayerView
+        targetView: PlayerView
     ) {
         try {
             // Если нет - добавляем SERVER_URL в начало
@@ -2755,7 +2903,7 @@ class MainActivity : AppCompatActivity() {
                                 addListener(object : AnimatorListenerAdapter() {
                                     override fun onAnimationEnd(animation: android.animation.Animator) {
                                         // 1. Отвязываем плеер от Surface
-                                        if (outgoingView is StyledPlayerView) {
+                                        if (outgoingView is PlayerView) {
                                             outgoingView.player = null
                                         }
                                         // 2. Останавливаем плеер и очищаем медиа
@@ -3295,7 +3443,38 @@ class MainActivity : AppCompatActivity() {
             scheduleConnectionWatchdog()
         }
     }
-    
+
+    private val metricsRunnable = object : Runnable {
+        override fun run() {
+            if (isDestroyed || isFinishing) {
+                return
+            }
+            Log.i(
+                TAG,
+                "24/7 metrics: ${PlayerMetrics.snapshot(SystemClock.elapsedRealtime() - startedAtMs)}, " +
+                    "temp=${readTemperatureC()}"
+            )
+            mainHandler.postDelayed(this, 5 * 60_000L)
+        }
+    }
+
+    private fun startMetricsLogging() {
+        mainHandler.removeCallbacks(metricsRunnable)
+        mainHandler.postDelayed(metricsRunnable, 5 * 60_000L)
+    }
+
+    private fun readTemperatureC(): String = try {
+        val zones = File("/sys/class/thermal")
+            .listFiles { file -> file.name.startsWith("thermal_zone") }
+            .orEmpty()
+        zones.mapNotNull { zone ->
+            val temp = File(zone, "temp").readText().trim().toLongOrNull() ?: return@mapNotNull null
+            "${zone.name}=${temp / 1000}C"
+        }.take(3).joinToString(",")
+    } catch (e: Exception) {
+        "n/a"
+    }
+
     private fun startPingTimer() {
         stopPingTimer() // Останавливаем предыдущий таймер если был
         
@@ -3344,7 +3523,7 @@ class MainActivity : AppCompatActivity() {
         // 24/7: если EVENT_CONNECT так и не пришёл, флаг оставался true навсегда
         // и watchdog больше не мог принудительно пересоздать сокет.
         if (isSocketReconnecting && socketReconnectStartedAt > 0L &&
-            now - socketReconnectStartedAt > 30_000L
+            now - socketReconnectStartedAt > PlayerPolicy.RECONNECT_STUCK_MS
         ) {
             Log.w(TAG, "Stuck socket reconnect detected ($reason), forcing new socket")
             isSocketReconnecting = false
@@ -3357,16 +3536,19 @@ class MainActivity : AppCompatActivity() {
         }
         
         val currentSocket = socket
+        if (currentSocket != null && !PlayerPolicy.shouldForceReconnect(
+                now, lastInboundAt, hasSeenPong, currentSocket.connected()
+            )
+        ) {
+            // Серверы без player/pong не дёргаем: должно быть хотя бы одно входящее событие.
+            socketBackoffMs = 2000L
+            return
+        }
         if (currentSocket != null && currentSocket.connected()) {
-            // connected() может быть true, пока входящие данные не читаются.
-            // Регулярный pong приходит на каждый ping (~20 с), поэтому 60 с без inbound — аномалия.
-            if (!hasSeenPong || lastInboundAt == 0L || now - lastInboundAt <= 60_000L) {
-                socketBackoffMs = 2000L
-                return
-            }
             Log.w(TAG, "Socket connected but no inbound for ${(now - lastInboundAt) / 1000}s, forcing reconnect ($reason)")
         }
         
+        PlayerMetrics.noteForcedReconnect()
         isSocketReconnecting = true
         lastSocketReconnectAttempt = now
         socketReconnectStartedAt = now
@@ -3420,7 +3602,7 @@ class MainActivity : AppCompatActivity() {
                     if (!playbackFlags.isPlayingPlaceholder && (isPlayingOrBuffering || isVideoReady)) {
                         val currentTime = exoPlayer.currentPosition / 1000 // в секундах
                         val duration = exoPlayer.duration
-                        val durationSeconds = if (duration > 0 && duration != com.google.android.exoplayer2.C.TIME_UNSET) {
+                        val durationSeconds = if (duration > 0 && duration != C.TIME_UNSET) {
                             duration / 1000
                         } else {
                             // Если длительность еще не известна, используем 0 (будет обновлено когда появится)
@@ -3485,6 +3667,7 @@ class MainActivity : AppCompatActivity() {
         stopPingTimer()
         stopConnectionWatchdog()
         stopProgressUpdates()
+        mainHandler.removeCallbacks(metricsRunnable)
         pendingSyncedPlayRunnable?.let {
             mainHandler.removeCallbacks(it)
             pendingSyncedPlayRunnable = null
@@ -3499,6 +3682,7 @@ class MainActivity : AppCompatActivity() {
         }
         // logoRefreshHandler удален - логотип больше не используется
         unregisterVolumeReceiver()
+        unregisterLifecycleReceivers()
         
         // Отменяем корутины
         placeholderJob?.cancel()
@@ -3560,6 +3744,8 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         Log.d(TAG, "onResume called (isFirstLaunch=$isFirstLaunch)")
+        // Система может сбросить wake lock после сна — возвращаем его сразу.
+        reacquireWakeLock()
         
         if (isFirstLaunch) {
             Log.d(TAG, "First launch, skipping restore (onCreate is loading placeholder)")
