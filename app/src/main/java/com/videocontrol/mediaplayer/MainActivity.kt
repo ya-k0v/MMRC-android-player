@@ -754,17 +754,18 @@ class MainActivity : AppCompatActivity() {
 
         if (networkCallback == null) {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
-            networkCallback = object : ConnectivityManager.NetworkCallback() {
+            val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) = onNetworkChanged("available")
                 override fun onLost(network: Network) = onNetworkChanged("lost")
                 override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) =
                     onNetworkChanged("link")
             }
+            networkCallback = callback
             val request = NetworkRequest.Builder()
                 .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 .build()
             try {
-                cm.registerNetworkCallback(request, networkCallback)
+                cm.registerNetworkCallback(request, callback)
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to register network callback", e)
                 networkCallback = null
